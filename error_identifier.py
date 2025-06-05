@@ -1,292 +1,349 @@
-# error_identifier.py
 import csv
 import logging
-import json # For structured report
-from typing import Dict, Tuple, Set, List, Optional, Callable, Any
+import json
+from typing import Dict, List, Optional, Any
 from enum import Enum
+import math
 
 import config
 
+# Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class AnomalyType(Enum):
+class RatioShiftAnomalyLevel(Enum):
     NO_ANOMALY = "NO_ANOMALY"
-    # Anomalie dla Kandydata A
-    A_R1_SUM_LESS_THAN_R2_VOTES = "A_R1_SUM_LESS_THAN_R2_VOTES" # d1_A < d2_A
-    A_R2_ZERO_R1_GROUP_POSITIVE = "A_R2_ZERO_R1_GROUP_POSITIVE" # d2_A = 0, d1_A > threshold
-    A_LOW_R2_PROPORTION_TO_R1_GROUP = "A_LOW_R2_PROPORTION_TO_R1_GROUP" # d1_A >= factor * d2_A
-    # Anomalie dla Kandydata B
-    B_R1_SUM_LESS_THAN_R2_VOTES = "B_R1_SUM_LESS_THAN_R2_VOTES" # d1_B < d2_B
-    B_R2_ZERO_R1_GROUP_POSITIVE = "B_R2_ZERO_R1_GROUP_POSITIVE" # d2_B = 0, d1_B > threshold
-    B_LOW_R2_PROPORTION_TO_R1_GROUP = "B_LOW_R2_PROPORTION_TO_R1_GROUP" # d1_B >= factor * d2_B
-    # Wnioski oparte na kombinacji
-    POTENTIAL_SWAP_A_FAVORS_B = "POTENTIAL_SWAP_A_FAVORS_B" # Anomalia A, B wygląda OK lub ma "odwrotną" anomalię
-    POTENTIAL_SWAP_B_FAVORS_A = "POTENTIAL_SWAP_B_FAVORS_A" # Anomalia B, A wygląda OK lub ma "odwrotną" anomalię
-    BOTH_CANDIDATES_ANOMALOUS_INDEPENDENTLY = "BOTH_CANDIDATES_ANOMALOUS_INDEPENDENTLY"
-    DATA_INCONSISTENCY_COMPLEX = "DATA_INCONSISTENCY_COMPLEX" # Np. obaj d1 < d2
-    UNKNOWN_ANOMALY = "UNKNOWN_ANOMALY"
+    SMALL_ANOMALY_A_LOST_SHARE_VS_B = "SMALL_ANOMALY_A_LOST_SHARE_VS_B"
+    SMALL_ANOMALY_B_LOST_SHARE_VS_A = "SMALL_ANOMALY_B_LOST_SHARE_VS_A"
+    LARGE_ANOMALY_A_LOST_SHARE_VS_B = "LARGE_ANOMALY_A_LOST_SHARE_VS_B"
+    LARGE_ANOMALY_B_LOST_SHARE_VS_A = "LARGE_ANOMALY_B_LOST_SHARE_VS_A"
+    INCONCLUSIVE_LOW_VOTES_R1 = "INCONCLUSIVE_LOW_VOTES_R1"
+    INCONCLUSIVE_LOW_VOTES_R2 = "INCONCLUSIVE_LOW_VOTES_R2"
+    INCONCLUSIVE_ZERO_DENOMINATOR_R1 = "INCONCLUSIVE_ZERO_DENOMINATOR_R1"
+    INCONCLUSIVE_ZERO_DENOMINATOR_R2 = "INCONCLUSIVE_ZERO_DENOMINATOR_R2"
+    DATA_ISSUE_INVALID_VOTES = "DATA_ISSUE_INVALID_VOTES"
 
-class TerytAnalysisResult:
+class TerytRatioAnalysis:
     def __init__(self, teryt: str):
-        self.teryt = teryt
-        self.votes_r1_group_A: Optional[int] = None
-        self.votes_r1_group_B: Optional[int] = None
+        self.teryt: str = teryt
+        self.votes_r1_cand_A: Optional[int] = None
+        self.votes_r1_cand_B: Optional[int] = None
         self.votes_r2_cand_A: Optional[int] = None
         self.votes_r2_cand_B: Optional[int] = None
-        self.anomalies_A: List[AnomalyType] = []
-        self.anomalies_B: List[AnomalyType] = []
-        self.derived_conclusion: AnomalyType = AnomalyType.NO_ANOMALY
-        self.description: str = ""
-        self.data_source_r1: Dict[str, Any] = {} # Original row from R1 data if needed
-        self.data_source_r2: Dict[str, Any] = {} # Original row from R2 data if needed
+        self.ratio_A_div_B_r1: Optional[float] = None
+        self.ratio_A_div_B_r2: Optional[float] = None
+        self.ratio_of_ratios_R2_div_R1: Optional[float] = None
+        self.estimated_votes_A_if_R1_ratio_kept_in_R2: Optional[float] = None
+        self.estimated_vote_shift_for_A: Optional[float] = None
+        self.anomaly_level: RatioShiftAnomalyLevel = RatioShiftAnomalyLevel.NO_ANOMALY
+        self.description: str = "Analysis pending."
 
     def to_dict(self) -> Dict[str, Any]:
+        def fmt_float(val: Optional[float]) -> Optional[str]:
+            if val is None or math.isnan(val) or math.isinf(val):
+                return None
+            return f"{val:.3f}"
+        def fmt_float_signed(val: Optional[float]) -> Optional[str]:
+            if val is None or math.isnan(val) or math.isinf(val):
+                return None
+            return f"{val:+.1f}"
         return {
             "teryt": self.teryt,
-            "votes_r1_group_A": self.votes_r1_group_A,
-            "votes_r1_group_B": self.votes_r1_group_B,
+            "votes_r1_cand_A": self.votes_r1_cand_A,
+            "votes_r1_cand_B": self.votes_r1_cand_B,
             "votes_r2_cand_A": self.votes_r2_cand_A,
             "votes_r2_cand_B": self.votes_r2_cand_B,
-            "anomalies_A": [a.value for a in self.anomalies_A],
-            "anomalies_B": [a.value for a in self.anomalies_B],
-            "derived_conclusion": self.derived_conclusion.value,
+            "ratio_A_div_B_r1": fmt_float(self.ratio_A_div_B_r1),
+            "ratio_A_div_B_r2": fmt_float(self.ratio_A_div_B_r2),
+            "ratio_of_ratios_R2_div_R1": fmt_float(self.ratio_of_ratios_R2_div_R1),
+            "estimated_votes_A_if_R1_ratio_kept_in_R2": fmt_float_signed(self.estimated_votes_A_if_R1_ratio_kept_in_R2),
+            "estimated_vote_shift_for_A": fmt_float_signed(self.estimated_vote_shift_for_A),
+            "anomaly_level": self.anomaly_level.value,
             "description": self.description,
-            # "data_source_r1": self.data_source_r1, # Potentially large, include if necessary
-            # "data_source_r2": self.data_source_r2,
         }
 
-# Funkcja _load_data_from_csv pozostaje podobna, ale dostosujemy jej użycie
-
-def load_round1_data_for_analysis(filename: str) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Loads R1 data, returning the full row for richer analysis."""
+def _load_election_data(filename: str, required_candidate_cols: List[str]) -> Optional[Dict[str, Dict[str, Any]]]:
     data_dict: Dict[str, Dict[str, Any]] = {}
-    # All candidates mentioned in R1 groups are potentially required
-    required_cols = list(set([config.TERYT_COLUMN_NAME] + config.CANDIDATE_A_R1_GROUP + config.CANDIDATE_B_R1_GROUP))
+    all_required_cols_in_header = list(set([config.TERYT_COLUMN_NAME] + required_candidate_cols))
     try:
         with open(filename, mode='r', encoding=config.CSV_ENCODING) as csvfile:
             reader = csv.DictReader(csvfile, delimiter=config.CSV_DELIMITER)
             if not reader.fieldnames:
                 logging.error(f"File {filename} is empty or does not contain headers.")
                 return None
-            missing = [col for col in required_cols if col not in reader.fieldnames]
-            if missing:
-                logging.error(f"R1 data file {filename} is missing columns: {missing}")
+            missing_cols = [col for col in all_required_cols_in_header if col not in reader.fieldnames]
+            if missing_cols:
+                logging.error(f"Data file {filename} is missing required columns: {missing_cols}. "
+                              "Please check column names in the file and in config.py.")
                 return None
             for i, row in enumerate(reader):
                 teryt = row.get(config.TERYT_COLUMN_NAME)
                 if not teryt:
-                    logging.warning(f"Missing TERYT in R1 data row {i+2} of {filename}. Skipping.")
-                    continue
-                data_dict[teryt] = row # Store the whole row
-    except FileNotFoundError:
-        logging.error(f"File {filename} not found.")
-        return None
-    except Exception as e:
-        logging.error(f"Error reading R1 data {filename}: {e}")
-        return None
-    logging.info(f"Successfully loaded {len(data_dict)} entries from R1 data file {filename}.")
-    return data_dict
-
-
-def load_round2_data_for_analysis(filename: str) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Loads R2 data, returning the full row."""
-    data_dict: Dict[str, Dict[str, Any]] = {}
-    required_cols = [config.TERYT_COLUMN_NAME, config.CANDIDATE_A_NAME_R2, config.CANDIDATE_B_NAME_R2]
-    try:
-        with open(filename, mode='r', encoding=config.CSV_ENCODING) as csvfile:
-            reader = csv.DictReader(csvfile, delimiter=config.CSV_DELIMITER)
-            if not reader.fieldnames:
-                logging.error(f"File {filename} is empty or does not contain headers.")
-                return None
-            missing = [col for col in required_cols if col not in reader.fieldnames]
-            if missing:
-                logging.error(f"R2 data file {filename} is missing columns: {missing}")
-                return None
-            for i, row in enumerate(reader):
-                teryt = row.get(config.TERYT_COLUMN_NAME)
-                if not teryt:
-                    logging.warning(f"Missing TERYT in R2 data row {i+2} of {filename}. Skipping.")
+                    logging.warning(f"Missing TERYT identifier in data row {i+2} of {filename}. Skipping this row.")
                     continue
                 data_dict[teryt] = row
     except FileNotFoundError:
-        logging.error(f"File {filename} not found.")
+        logging.error(f"Data file {filename} not found.")
         return None
     except Exception as e:
-        logging.error(f"Error reading R2 data {filename}: {e}")
+        logging.error(f"An unexpected error occurred while reading data file {filename}: {e}")
         return None
-    logging.info(f"Successfully loaded {len(data_dict)} entries from R2 data file {filename}.")
+    logging.info(f"Successfully loaded {len(data_dict)} entries from data file {filename}.")
     return data_dict
 
-def _get_int_vote(row_dict: Dict[str, Any], candidate_name: str, default: int = 0) -> int:
+def _get_int_vote(row_dict: Dict[str, Any], candidate_name: str, teryt: str) -> Optional[int]:
     try:
-        return int(row_dict.get(candidate_name, default) or default)
+        vote_str = row_dict.get(candidate_name)
+        if vote_str is None or vote_str.strip() == "":
+            return 0
+        votes = int(vote_str)
+        if votes < 0:
+            logging.warning(f"Data integrity issue: Negative vote count ({votes}) found for candidate "
+                            f"'{candidate_name}' in TERYT {teryt}. Treating as invalid (None).")
+            return None
+        return votes
     except (ValueError, TypeError):
-        return default
+        logging.warning(f"Data integrity issue: Invalid (non-integer or malformed) vote count "
+                        f"for candidate '{candidate_name}' in TERYT {teryt} (value: '{vote_str}'). Treating as invalid (None).")
+        return None
 
-def _get_group_sum(row_dict: Dict[str, Any], candidate_group: List[str]) -> int:
-    s = 0
-    for cand in candidate_group:
-        s += _get_int_vote(row_dict, cand)
-    return s
+def calculate_ratio(numerator: Optional[int], denominator: Optional[int]) -> Optional[float]:
+    if numerator is None or denominator is None:
+        return None
+    if denominator == 0:
+        if numerator == 0:
+            return None
+        elif numerator > 0:
+            return float('inf')
+        else:
+            return float('-inf')
+    return numerator / denominator
 
-
-def analyze_teryt_anomalies(
+def analyze_vote_ratios_between_rounds(
     data_r1: Dict[str, Dict[str, Any]],
     data_r2: Dict[str, Dict[str, Any]]
-) -> List[TerytAnalysisResult]:
-    """
-    Performs detailed anomaly analysis for each TERYT common to both datasets.
-    """
-    analysis_results: List[TerytAnalysisResult] = []
+) -> List[TerytRatioAnalysis]:
+    analysis_results: List[TerytRatioAnalysis] = []
     common_teryts = set(data_r1.keys()) & set(data_r2.keys())
-    logging.info(f"Found {len(common_teryts)} common TERYTs for analysis.")
+    logging.info(f"Found {len(common_teryts)} common TERYTs for ratio shift analysis.")
 
-    if config.CANDIDATE_A_NAME_R2 not in config.CANDIDATE_A_R1_GROUP:
-        logging.warning(f"Config check: CANDIDATE_A_NAME_R2 ('{config.CANDIDATE_A_NAME_R2}') "
-                        f"is not in CANDIDATE_A_R1_GROUP. Analysis for A might be flawed.")
-    if config.CANDIDATE_B_NAME_R2 not in config.CANDIDATE_B_R1_GROUP:
-        logging.warning(f"Config check: CANDIDATE_B_NAME_R2 ('{config.CANDIDATE_B_NAME_R2}') "
-                        f"is not in CANDIDATE_B_R1_GROUP. Analysis for B might be flawed.")
+    for teryt_code in common_teryts:
+        result = TerytRatioAnalysis(teryt_code)
+        row_r1 = data_r1[teryt_code]
+        row_r2 = data_r2[teryt_code]
+        v1A = _get_int_vote(row_r1, config.CANDIDATE_A_NAME_R1, teryt_code)
+        v1B = _get_int_vote(row_r1, config.CANDIDATE_B_NAME_R1, teryt_code)
+        v2A = _get_int_vote(row_r2, config.CANDIDATE_A_NAME_R2, teryt_code)
+        v2B = _get_int_vote(row_r2, config.CANDIDATE_B_NAME_R2, teryt_code)
+        result.votes_r1_cand_A, result.votes_r1_cand_B = v1A, v1B
+        result.votes_r2_cand_A, result.votes_r2_cand_B = v2A, v2B
 
-    for teryt in common_teryts:
-        res = TerytAnalysisResult(teryt)
-        row_r1 = data_r1[teryt]
-        row_r2 = data_r2[teryt]
+        if any(v is None for v in [v1A, v1B, v2A, v2B]):
+            result.anomaly_level = RatioShiftAnomalyLevel.DATA_ISSUE_INVALID_VOTES
+            result.description = "One or more key candidate vote counts were invalid (e.g., non-numeric, negative), preventing ratio analysis."
+            analysis_results.append(result)
+            continue
 
-        res.data_source_r1 = row_r1 # For potential deeper inspection
-        res.data_source_r2 = row_r2
+        if (v1A + v1B) < config.MIN_TOTAL_VOTES_AB_FOR_RATIO_ANALYSIS_R1:
+            result.anomaly_level = RatioShiftAnomalyLevel.INCONCLUSIVE_LOW_VOTES_R1
+            result.description = (f"R1 A+B votes ({v1A + v1B}) is below the threshold "
+                                  f"({config.MIN_TOTAL_VOTES_AB_FOR_RATIO_ANALYSIS_R1}) for reliable ratio calculation.")
+            analysis_results.append(result)
+            continue
 
-        # Calculate votes
-        res.votes_r1_group_A = _get_group_sum(row_r1, config.CANDIDATE_A_R1_GROUP)
-        res.votes_r1_group_B = _get_group_sum(row_r1, config.CANDIDATE_B_R1_GROUP)
-        res.votes_r2_cand_A = _get_int_vote(row_r2, config.CANDIDATE_A_NAME_R2)
-        res.votes_r2_cand_B = _get_int_vote(row_r2, config.CANDIDATE_B_NAME_R2)
+        if (v2A + v2B) < config.MIN_TOTAL_VOTES_AB_FOR_RATIO_ANALYSIS_R2:
+            result.anomaly_level = RatioShiftAnomalyLevel.INCONCLUSIVE_LOW_VOTES_R2
+            result.description = (f"R2 A+B votes ({v2A + v2B}) is below the threshold "
+                                  f"({config.MIN_TOTAL_VOTES_AB_FOR_RATIO_ANALYSIS_R2}) for reliable shift analysis.")
+            analysis_results.append(result)
+            continue
 
-        d1A, d1B = res.votes_r1_group_A, res.votes_r1_group_B
-        d2A, d2B = res.votes_r2_cand_A, res.votes_r2_cand_B
-        
-        # --- Analyze for Candidate A ---
-        if d1A < d2A:
-            res.anomalies_A.append(AnomalyType.A_R1_SUM_LESS_THAN_R2_VOTES)
-        else: # Only if not the above, check proportionality
-            if d2A == 0 and d1A >= config.MIN_R1_GROUP_VOTES_FOR_ZERO_R2_ANOMALY:
-                res.anomalies_A.append(AnomalyType.A_R2_ZERO_R1_GROUP_POSITIVE)
-            elif d2A > 0 and d1A >= config.PROPORTIONALITY_THRESHOLD_FACTOR * d2A:
-                res.anomalies_A.append(AnomalyType.A_LOW_R2_PROPORTION_TO_R1_GROUP)
+        result.ratio_A_div_B_r1 = calculate_ratio(v1A, v1B)
+        result.ratio_A_div_B_r2 = calculate_ratio(v2A, v2B)
 
-        # --- Analyze for Candidate B ---
-        if d1B < d2B:
-            res.anomalies_B.append(AnomalyType.B_R1_SUM_LESS_THAN_R2_VOTES)
-        else: # Only if not the above, check proportionality
-            if d2B == 0 and d1B >= config.MIN_R1_GROUP_VOTES_FOR_ZERO_R2_ANOMALY:
-                res.anomalies_B.append(AnomalyType.B_R2_ZERO_R1_GROUP_POSITIVE)
-            elif d2B > 0 and d1B >= config.PROPORTIONALITY_THRESHOLD_FACTOR * d2B:
-                res.anomalies_B.append(AnomalyType.B_LOW_R2_PROPORTION_TO_R1_GROUP)
+        if result.ratio_A_div_B_r1 is None or math.isinf(result.ratio_A_div_B_r1):
+            result.anomaly_level = RatioShiftAnomalyLevel.INCONCLUSIVE_ZERO_DENOMINATOR_R1
+            desc = f"{config.CANDIDATE_B_NAME_R1} (denominator) had 0 votes in R1 (A votes: {v1A}). " \
+                   f"Cannot reliably calculate R1 A/B ratio or its shift."
+            if v1B == 0 and v1A > 0 and v2A == 0 and v2B > 0:
+                result.anomaly_level = RatioShiftAnomalyLevel.LARGE_ANOMALY_A_LOST_SHARE_VS_B
+                desc += " Extreme reversal: A had all R1 votes, B gained all R2 votes."
+                result.estimated_vote_shift_for_A = float(v2A - v1A)
+            result.description = desc
+            analysis_results.append(result)
+            continue
 
-        # --- Derive Conclusion ---
-        # This logic can be quite complex and domain-specific
-        desc_parts = []
-        if res.anomalies_A:
-            desc_parts.append(f"Anomalies for {config.CANDIDATE_A_NAME_R2}: {', '.join(a.value for a in res.anomalies_A)}")
-        if res.anomalies_B:
-            desc_parts.append(f"Anomalies for {config.CANDIDATE_B_NAME_R2}: {', '.join(a.value for a in res.anomalies_B)}")
+        if result.ratio_A_div_B_r2 is None or math.isinf(result.ratio_A_div_B_r2):
+            result.anomaly_level = RatioShiftAnomalyLevel.INCONCLUSIVE_ZERO_DENOMINATOR_R2
+            desc = f"{config.CANDIDATE_B_NAME_R2} (denominator) had 0 votes in R2 (A votes: {v2A}). " \
+                   f"Cannot reliably calculate R2 A/B ratio or its shift."
+            if v1A == 0 and v1B > 0 and v2B == 0 and v2A > 0:
+                result.anomaly_level = RatioShiftAnomalyLevel.LARGE_ANOMALY_B_LOST_SHARE_VS_A
+                desc += " Extreme reversal: B had all R1 votes, A gained all R2 votes."
+                result.estimated_vote_shift_for_A = float(v2A)
+            result.description = desc
+            analysis_results.append(result)
+            continue
 
-        # Simplified conclusion logic - can be expanded
-        is_A_problematic = bool(res.anomalies_A)
-        is_B_problematic = bool(res.anomalies_B)
+        result.ratio_of_ratios_R2_div_R1 = result.ratio_A_div_B_r2 / result.ratio_A_div_B_r1
+        result.estimated_votes_A_if_R1_ratio_kept_in_R2 = v2B * result.ratio_A_div_B_r1
+        result.estimated_vote_shift_for_A = v2A - result.estimated_votes_A_if_R1_ratio_kept_in_R2
 
-        if AnomalyType.A_R1_SUM_LESS_THAN_R2_VOTES in res.anomalies_A and \
-           AnomalyType.B_R1_SUM_LESS_THAN_R2_VOTES in res.anomalies_B:
-            res.derived_conclusion = AnomalyType.DATA_INCONSISTENCY_COMPLEX
-            desc_parts.append("Severe data inconsistency for both candidates (R1 sum < R2 votes).")
-        elif is_A_problematic and not is_B_problematic:
-            # If A has issues, and B's R2 votes are significantly higher than A's R2 votes (and A's R2 is low)
-            # it might suggest A's votes were swapped to B.
-            if d2A < d2B and (AnomalyType.A_R2_ZERO_R1_GROUP_POSITIVE in res.anomalies_A or \
-                              AnomalyType.A_LOW_R2_PROPORTION_TO_R1_GROUP in res.anomalies_A):
-                res.derived_conclusion = AnomalyType.POTENTIAL_SWAP_A_FAVORS_B
-                desc_parts.append(f"Potential swap: {config.CANDIDATE_A_NAME_R2} anomaly, {config.CANDIDATE_B_NAME_R2} has higher R2 votes.")
-            else:
-                res.derived_conclusion = res.anomalies_A[0] # Take first anomaly as primary
-        elif not is_A_problematic and is_B_problematic:
-            if d2B < d2A and (AnomalyType.B_R2_ZERO_R1_GROUP_POSITIVE in res.anomalies_B or \
-                              AnomalyType.B_LOW_R2_PROPORTION_TO_R1_GROUP in res.anomalies_B):
-                res.derived_conclusion = AnomalyType.POTENTIAL_SWAP_B_FAVORS_A
-                desc_parts.append(f"Potential swap: {config.CANDIDATE_B_NAME_R2} anomaly, {config.CANDIDATE_A_NAME_R2} has higher R2 votes.")
-            else:
-                res.derived_conclusion = res.anomalies_B[0]
-        elif is_A_problematic and is_B_problematic:
-            res.derived_conclusion = AnomalyType.BOTH_CANDIDATES_ANOMALOUS_INDEPENDENTLY
-            desc_parts.append("Both candidates show independent anomalies.")
-        
-        if not res.anomalies_A and not res.anomalies_B:
-            res.derived_conclusion = AnomalyType.NO_ANOMALY
-            desc_parts.append("No specific anomalies detected based on current rules.")
-        
-        res.description = "; ".join(desc_parts)
-        analysis_results.append(res)
+        desc_parts = [
+            f"R1: {config.CANDIDATE_A_NAME_R1}={v1A}, {config.CANDIDATE_B_NAME_R1}={v1B} (A/B Ratio: {result.ratio_A_div_B_r1:.2f}).",
+            f"R2: {config.CANDIDATE_A_NAME_R2}={v2A}, {config.CANDIDATE_B_NAME_R2}={v2B} (A/B Ratio: {result.ratio_A_div_B_r2:.2f}).",
+            f"Change Factor (R2 Ratio / R1 Ratio): {result.ratio_of_ratios_R2_div_R1:.2f}."
+        ]
+        if result.estimated_vote_shift_for_A is not None:
+            desc_parts.append(f"Estimated vote shift for {config.CANDIDATE_A_NAME_R2}: {result.estimated_vote_shift_for_A:+.1f} votes "
+                              f"(Actual R2 A: {v2A}, Expected A if R1 A/B ratio kept: {result.estimated_votes_A_if_R1_ratio_kept_in_R2:.1f}).")
 
-    # Log summary of TERYTs not in common
-    r1_only = set(data_r1.keys()) - common_teryts
-    r2_only = set(data_r2.keys()) - common_teryts
-    if r1_only:
-        logging.info(f"{len(r1_only)} TERYTs present only in R1 data: {list(r1_only)[:5]}...") # Show a few
-    if r2_only:
-        logging.info(f"{len(r2_only)} TERYTs present only in R2 data: {list(r2_only)[:5]}...")
+        ror = result.ratio_of_ratios_R2_div_R1
+        abs_vote_shift_A = abs(result.estimated_vote_shift_for_A)
+        current_anomaly_level = RatioShiftAnomalyLevel.NO_ANOMALY
+        anomaly_description_suffix = "No significant ratio shift detected."
+
+        if abs_vote_shift_A >= config.MIN_ABS_VOTE_SHIFT_FOR_SIGNIFICANT_ANOMALY:
+            if ror < (1 / config.LARGE_ANOMALY_RATIO_CHANGE_FACTOR):
+                current_anomaly_level = RatioShiftAnomalyLevel.LARGE_ANOMALY_A_LOST_SHARE_VS_B
+                anomaly_description_suffix = f"LARGE shift: {config.CANDIDATE_A_NAME_R1}'s vote share relative to B significantly DECREASED."
+            elif ror > config.LARGE_ANOMALY_RATIO_CHANGE_FACTOR:
+                current_anomaly_level = RatioShiftAnomalyLevel.LARGE_ANOMALY_B_LOST_SHARE_VS_A
+                anomaly_description_suffix = f"LARGE shift: {config.CANDIDATE_A_NAME_R1}'s vote share relative to B significantly INCREASED (i.e., B lost share to A)."
+            elif ror < (1 / config.SMALL_ANOMALY_RATIO_CHANGE_FACTOR):
+                current_anomaly_level = RatioShiftAnomalyLevel.SMALL_ANOMALY_A_LOST_SHARE_VS_B
+                anomaly_description_suffix = f"Small shift: {config.CANDIDATE_A_NAME_R1}'s vote share relative to B DECREASED."
+            elif ror > config.SMALL_ANOMALY_RATIO_CHANGE_FACTOR:
+                current_anomaly_level = RatioShiftAnomalyLevel.SMALL_ANOMALY_B_LOST_SHARE_VS_A
+                anomaly_description_suffix = f"Small shift: {config.CANDIDATE_A_NAME_R1}'s vote share relative to B INCREASED (i.e., B lost share to A)."
+        else:
+            if (ror < (1 / config.SMALL_ANOMALY_RATIO_CHANGE_FACTOR) or ror > config.SMALL_ANOMALY_RATIO_CHANGE_FACTOR):
+                anomaly_description_suffix = (f"Ratio change detected, but absolute vote shift for A ({result.estimated_vote_shift_for_A:+.1f}) "
+                                              f"is below threshold ({config.MIN_ABS_VOTE_SHIFT_FOR_SIGNIFICANT_ANOMALY}).")
+
+        result.anomaly_level = current_anomaly_level
+        desc_parts.append(anomaly_description_suffix)
+        result.description = " ".join(desc_parts)
+        analysis_results.append(result)
+
+    r1_only_teryts = set(data_r1.keys()) - common_teryts
+    r2_only_teryts = set(data_r2.keys()) - common_teryts
+    if r1_only_teryts:
+        logging.info(f"{len(r1_only_teryts)} TERYTs found only in Round 1 data (first 5 shown): {list(r1_only_teryts)[:5]}")
+    if r2_only_teryts:
+        logging.info(f"{len(r2_only_teryts)} TERYTs found only in Round 2 data (first 5 shown): {list(r2_only_teryts)[:5]}")
 
     return analysis_results
 
-def save_analysis_report(report_data: List[TerytAnalysisResult], filename: str):
-    """Saves the detailed analysis report to a JSON file."""
+def save_analysis_report_to_json(report_data: List[TerytRatioAnalysis], filename: str) -> None:
     dict_report = [res.to_dict() for res in report_data]
     try:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(dict_report, f, indent=2, ensure_ascii=False)
-        logging.info(f"Successfully saved detailed analysis report to {filename}")
+        logging.info(f"Successfully saved detailed ratio analysis report to {filename}")
     except IOError as e:
-        logging.error(f"Failed to write analysis report to {filename}: {e}")
+        logging.error(f"Failed to write ratio analysis report to {filename}: {e}")
 
-def generate_teryts_for_swap_file(report_data: List[TerytAnalysisResult], filename: str):
-    """
-    Generates a simple text file with TERYTs suggested for vote swapping.
-    This is a simplified action based on the report; manual review is advised.
-    """
-    teryts_to_swap: Set[str] = set()
+def generate_significant_shifts_teryts_file(report_data: List[TerytRatioAnalysis], filename: str) -> None:
+    teryts_for_investigation: List[str] = []
     for res in report_data:
-        if res.derived_conclusion in [AnomalyType.POTENTIAL_SWAP_A_FAVORS_B, AnomalyType.POTENTIAL_SWAP_B_FAVORS_A]:
-            teryts_to_swap.add(res.teryt)
-    
+        if res.anomaly_level in [
+            RatioShiftAnomalyLevel.LARGE_ANOMALY_A_LOST_SHARE_VS_B,
+            RatioShiftAnomalyLevel.LARGE_ANOMALY_B_LOST_SHARE_VS_A,
+        ]:
+            teryts_for_investigation.append(res.teryt)
     try:
         with open(filename, 'w', encoding='utf-8') as f:
-            for teryt in sorted(list(teryts_to_swap)):
-                f.write(f"{teryt}\n")
-        logging.info(f"Saved {len(teryts_to_swap)} TERYTs suggested for vote swapping to {filename}")
+            for teryt_code in sorted(teryts_for_investigation):
+                f.write(f"{teryt_code}\n")
+        logging.info(f"Saved {len(teryts_for_investigation)} TERYTs identified with large ratio shifts to {filename}")
     except IOError as e:
-        logging.error(f"Failed to write TERYTs for swap file to {filename}: {e}")
+        logging.error(f"Failed to write TERYTs with large ratio shifts file to {filename}: {e}")
 
+def generate_summary_report(report_data: List[TerytRatioAnalysis], filename: str) -> None:
+    summary_lines = [
+        "--- Election Vote Ratio Shift Analysis Summary ---",
+        f"Analysis based on configured candidates: A='{config.CANDIDATE_A_NAME_R1}' (R1) / '{config.CANDIDATE_A_NAME_R2}' (R2) "
+        f"and B='{config.CANDIDATE_B_NAME_R1}' (R1) / '{config.CANDIDATE_B_NAME_R2}' (R2)."
+    ]
+    anomaly_counts: Dict[RatioShiftAnomalyLevel, int] = {}
+    total_estimated_shift_A_overall: float = 0.0
+    teryts_counted_for_shift_A: int = 0
+    sum_shift_when_A_lost_share: float = 0.0
+    count_teryts_A_lost_share: int = 0
+    sum_shift_when_B_lost_share: float = 0.0
+    count_teryts_B_lost_share: int = 0
+
+    for res in report_data:
+        anomaly_counts[res.anomaly_level] = anomaly_counts.get(res.anomaly_level, 0) + 1
+        if res.estimated_vote_shift_for_A is not None and \
+           res.anomaly_level not in [RatioShiftAnomalyLevel.INCONCLUSIVE_LOW_VOTES_R1,
+                                      RatioShiftAnomalyLevel.INCONCLUSIVE_LOW_VOTES_R2,
+                                      RatioShiftAnomalyLevel.INCONCLUSIVE_ZERO_DENOMINATOR_R1,
+                                      RatioShiftAnomalyLevel.INCONCLUSIVE_ZERO_DENOMINATOR_R2,
+                                      RatioShiftAnomalyLevel.DATA_ISSUE_INVALID_VOTES,
+                                      RatioShiftAnomalyLevel.NO_ANOMALY]:
+            total_estimated_shift_A_overall += res.estimated_vote_shift_for_A
+            teryts_counted_for_shift_A += 1
+            if res.anomaly_level in [RatioShiftAnomalyLevel.SMALL_ANOMALY_A_LOST_SHARE_VS_B, RatioShiftAnomalyLevel.LARGE_ANOMALY_A_LOST_SHARE_VS_B]:
+                sum_shift_when_A_lost_share += res.estimated_vote_shift_for_A
+                count_teryts_A_lost_share += 1
+            elif res.anomaly_level in [RatioShiftAnomalyLevel.SMALL_ANOMALY_B_LOST_SHARE_VS_A, RatioShiftAnomalyLevel.LARGE_ANOMALY_B_LOST_SHARE_VS_A]:
+                sum_shift_when_B_lost_share += res.estimated_vote_shift_for_A
+                count_teryts_B_lost_share += 1
+
+    summary_lines.append("\n--- Anomaly Level Distribution ---")
+    for level, count in sorted(anomaly_counts.items(), key=lambda item: item[0].value):
+        summary_lines.append(f"- {level.value}: {count} TERYTs")
+
+    summary_lines.append(f"\n--- Estimated Vote Shift Summary for Candidate A ('{config.CANDIDATE_A_NAME_R2}') ---")
+    summary_lines.append(f"(Based on {teryts_counted_for_shift_A} TERYTs with conclusive anomaly and estimable shift)")
+
+    if count_teryts_A_lost_share > 0:
+        summary_lines.append(
+            f"- Total estimated 'loss' for {config.CANDIDATE_A_NAME_R2} where A's share anomalously decreased: "
+            f"{sum_shift_when_A_lost_share:+.1f} votes (across {count_teryts_A_lost_share} TERYTs)."
+        )
+    if count_teryts_B_lost_share > 0:
+        summary_lines.append(
+            f"- Total estimated 'gain' for {config.CANDIDATE_A_NAME_R2} where B's share anomalously decreased (favoring A): "
+            f"{sum_shift_when_B_lost_share:+.1f} votes (across {count_teryts_B_lost_share} TERYTs)."
+        )
+    summary_lines.append(
+        f"- Overall net estimated shift for {config.CANDIDATE_A_NAME_R2} across all flagged anomalous TERYTs: "
+        f"{total_estimated_shift_A_overall:+.1f} votes."
+    )
+    summary_lines.append("\nInterpretation Note:")
+    summary_lines.append("  'Estimated vote shift' is a heuristic. It quantifies how many more (positive) or fewer (negative) "
+                         "votes Candidate A received in R2 compared to what would be expected if the A/B vote ratio from R1 "
+                         "had been perfectly preserved in R2 (given Candidate B's actual R2 votes).")
+    summary_lines.append("  This does NOT definitively prove errors or fraud but highlights areas for closer inspection.")
+
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            for line in summary_lines:
+                f.write(line + "\n")
+        logging.info(f"Successfully saved summary report of ratio shift analysis to {filename}")
+    except IOError as e:
+        logging.error(f"Failed to write summary report to {filename}: {e}")
 
 if __name__ == "__main__":
-    logging.info(f"Starting detailed error analysis process.")
-    
-    data_r1 = load_round1_data_for_analysis(config.ERROR_ID_INPUT_FILE1_PATH)
-    data_r2 = load_round2_data_for_analysis(config.ERROR_ID_INPUT_FILE2_PATH)
-
+    logging.info(f"Starting election vote ratio shift analysis between Round 1 and Round 2.")
+    r1_essential_candidate_cols = [config.CANDIDATE_A_NAME_R1, config.CANDIDATE_B_NAME_R1]
+    r2_essential_candidate_cols = [config.CANDIDATE_A_NAME_R2, config.CANDIDATE_B_NAME_R2]
+    data_r1 = _load_election_data(config.ROUND1_RESULTS_FILE_PATH, r1_essential_candidate_cols)
+    data_r2 = _load_election_data(config.ROUND2_RESULTS_FILE_PATH, r2_essential_candidate_cols)
     if data_r1 and data_r2:
-        analysis_results = analyze_teryt_anomalies(data_r1, data_r2)
-        save_analysis_report(analysis_results, config.ERROR_ANALYSIS_REPORT_FILE)
-
-        # Optionally, generate a list of TERYTs for the vote_adjuster if a swap is suspected
-        generate_teryts_for_swap_file(analysis_results, config.TERYTS_FOR_SWAP_FILE)
-
-        # Log summary of conclusions
-        conclusion_counts: Dict[AnomalyType, int] = {}
+        analysis_results = analyze_vote_ratios_between_rounds(data_r1, data_r2)
+        save_analysis_report_to_json(analysis_results, config.RATIO_ANALYSIS_REPORT_FILE)
+        generate_significant_shifts_teryts_file(analysis_results, config.SIGNIFICANT_RATIO_SHIFTS_TERYTS_FILE)
+        generate_summary_report(analysis_results, config.SUMMARY_REPORT_FILE)
+        logging.info("--- Ratio Shift Analysis Conclusion Summary (from main execution) ---")
+        conclusion_counts: Dict[RatioShiftAnomalyLevel, int] = {}
         for res in analysis_results:
-            conclusion_counts[res.derived_conclusion] = conclusion_counts.get(res.derived_conclusion, 0) + 1
-        
-        logging.info("--- Analysis Conclusion Summary ---")
-        for anomaly_type, count in conclusion_counts.items():
-            logging.info(f"{anomaly_type.value}: {count} TERYTs")
+            conclusion_counts[res.anomaly_level] = conclusion_counts.get(res.anomaly_level, 0) + 1
+        for conclusion_type, count in sorted(conclusion_counts.items(), key=lambda item: item[0].value):
+            logging.info(f"{conclusion_type.value}: {count} TERYTs")
     else:
-        logging.error("Detailed error analysis aborted due to issues loading data files.")
-
-    logging.info("Detailed error analysis process finished.")
+        logging.error("Ratio shift analysis aborted due to critical issues in loading data files. "
+                      "Please check previous error messages and file paths in config.py.")
+    logging.info("Election vote ratio shift analysis process finished.")

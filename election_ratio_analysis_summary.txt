@@ -1,0 +1,17 @@
+--- Election Vote Ratio Shift Analysis Summary ---
+Analysis based on configured candidates: A='TRZASKOWSKI Rafał Kazimierz' (R1) / 'TRZASKOWSKI Rafał Kazimierz' (R2) and B='NAWROCKI Karol Tadeusz' (R1) / 'NAWROCKI Karol Tadeusz' (R2).
+
+--- Anomaly Level Distribution ---
+- NO_ANOMALY: 2479 TERYTs
+- SMALL_ANOMALY_A_LOST_SHARE_VS_B: 12 TERYTs
+- SMALL_ANOMALY_B_LOST_SHARE_VS_A: 5 TERYTs
+
+--- Estimated Vote Shift Summary for Candidate A ('TRZASKOWSKI Rafał Kazimierz') ---
+(Based on 17 TERYTs with conclusive anomaly and estimable shift)
+- Total estimated 'loss' for TRZASKOWSKI Rafał Kazimierz where A's share anomalously decreased: -14805.1 votes (across 12 TERYTs).
+- Total estimated 'gain' for TRZASKOWSKI Rafał Kazimierz where B's share anomalously decreased (favoring A): +357.5 votes (across 5 TERYTs).
+- Overall net estimated shift for TRZASKOWSKI Rafał Kazimierz across all flagged anomalous TERYTs: -14447.6 votes.
+
+Interpretation Note:
+  'Estimated vote shift' is a heuristic. It quantifies how many more (positive) or fewer (negative) votes Candidate A received in R2 compared to what would be expected if the A/B vote ratio from R1 had been perfectly preserved in R2 (given Candidate B's actual R2 votes).
+  This does NOT definitively prove errors or fraud but highlights areas for closer inspection.

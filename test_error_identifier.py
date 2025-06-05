@@ -1,188 +1,326 @@
 # test_error_identifier.py
 import pytest
 import csv
-import logging
 from pathlib import Path
-from typing import List, Dict, Tuple, Set
+import json
+import logging # For caplog.at_level
+from typing import List, Dict, Any, Tuple
 
-# Import functions and config from the script to be tested
+# Import functions and classes from the script to be tested
 from error_identifier import (
-    _load_data_from_csv,
-    load_round1_data,
-    load_round2_data_for_comparison,
-    identify_error_teryts,
-    save_error_teryts
+    _load_election_data,
+    _get_int_vote,
+    analyze_relative_strength_shifts,
+    save_analysis_report_to_json,
+    generate_suspicious_shifts_file,
+    TerytShiftAnalysis, # Class to check instance of
+    ShiftAnalysisConclusion # Enum for conclusions
 )
-import config as test_config # Use the main config for consistency in tests
+# We'll use monkeypatch to modify config for specific tests
+import config as live_config # Import the actual config to be monkeypatched
 
-# Override config for testing if necessary, or use test-specific CSVs
-# For simplicity, we'll rely on creating test CSVs that match the main config's candidate names
+# --- Helper Functions for Tests ---
 
-def create_test_csv(tmp_path: Path, filename: str, headers: List[str], data_rows: List[List[str]]) -> Path:
+def create_test_csv_file(tmp_path: Path, filename: str, headers: List[str], data_rows: List[List[str]]) -> Path:
+    """Helper function to create a temporary CSV file for testing."""
     file_path = tmp_path / filename
-    with open(file_path, 'w', newline='', encoding=test_config.CSV_ENCODING) as f:
-        writer = csv.writer(f, delimiter=test_config.CSV_DELIMITER)
+    with open(file_path, 'w', newline='', encoding=live_config.CSV_ENCODING) as f:
+        writer = csv.writer(f, delimiter=live_config.CSV_DELIMITER)
         writer.writerow(headers)
         writer.writerows(data_rows)
     return file_path
 
-@pytest.fixture
-def round1_headers() -> List[str]:
-    return [test_config.TERYT_COLUMN_NAME] + test_config.R1_CANDIDATES_GROUP1 + test_config.R1_CANDIDATES_GROUP2
+def mock_config_for_shift_analysis_tests(monkeypatch, cand_a_r1, cand_a_r2, cand_b_r1, cand_b_r2, thresholds: Dict[str, Any]):
+    """
+    Uses monkeypatch to set specific config values for the duration of a test.
+    """
+    monkeypatch.setattr(live_config, 'CANDIDATE_A_NAME_R1', cand_a_r1)
+    monkeypatch.setattr(live_config, 'CANDIDATE_A_NAME_R2', cand_a_r2)
+    monkeypatch.setattr(live_config, 'CANDIDATE_B_NAME_R1', cand_b_r1)
+    monkeypatch.setattr(live_config, 'CANDIDATE_B_NAME_R2', cand_b_r2)
+    for key, value in thresholds.items():
+        monkeypatch.setattr(live_config, key, value)
+    # Ensure TERYT_COLUMN_NAME is also set if it's not the default from live_config
+    monkeypatch.setattr(live_config, 'TERYT_COLUMN_NAME', 'TERYT_ID_COL') # Using a distinct test column name
 
-@pytest.fixture
-def round2_headers() -> List[str]:
-    return [test_config.TERYT_COLUMN_NAME, test_config.R2_COMPARISON_CANDIDATE1_NAME, test_config.R2_COMPARISON_CANDIDATE2_NAME]
 
+# --- Tests for _load_election_data ---
 
-# --- Tests for _load_data_from_csv (indirectly via specific loaders) ---
-def test_load_round1_data_happy_path(tmp_path: Path, round1_headers: List[str]):
-    # R1_CANDIDATES_GROUP1 = ["ZANDBERG", "TRZASKOWSKI_R1", "BIEJAT"] (assuming these are first 3 after TERYT)
-    # R1_CANDIDATES_GROUP2 = ["BRAUN", "MENTZEN", "NAWROCKI_R1"] (assuming these are next 3)
-    # For test_config:
-    # test_config.R1_CANDIDATES_GROUP1[0] = "ZANDBERG Adrian Tadeusz"
-    # test_config.R1_CANDIDATES_GROUP1[1] = "TRZASKOWSKI Rafał Kazimierz"
-    # test_config.R1_CANDIDATES_GROUP1[2] = "BIEJAT Magdalena Agnieszka"
-    # test_config.R1_CANDIDATES_GROUP2[2] = "NAWROCKI Karol Tadeusz"
-
+def test_load_election_data_success(tmp_path: Path, monkeypatch):
+    """Test successful loading of data."""
+    monkeypatch.setattr(live_config, 'TERYT_COLUMN_NAME', 'TERYT_ID_COL')
+    headers = ["TERYT_ID_COL", "CandA", "CandB", "Other"]
     data_rows = [
-        # TERYT, ZANDBERG, TRZASKOWSKI_R1, BIEJAT, BRAUN, MENTZEN, NAWROCKI_R1
-        ["01",   "10",     "100",          "5",    "2",   "3",     "50"], # G1_sum=115, G2_sum=55
-        ["02",   "20",     "200",          "10",   "4",   "6",     "100"],# G1_sum=230, G2_sum=110
+        ["001", "100", "50", "x"],
+        ["002", "70", "80", "y"],
     ]
-    # Pad with zeros for other candidates if R1_CANDIDATES_GROUPx have more than 3 elements
-    full_data_rows = []
-    for row_base in data_rows:
-        row = [row_base[0]] # TERYT
-        row.extend(row_base[1:1+len(test_config.R1_CANDIDATES_GROUP1)]) # Group 1 votes
-        # Pad if fewer votes provided than candidates in group 1
-        row.extend(["0"] * (len(test_config.R1_CANDIDATES_GROUP1) - (len(row_base)-1-len(test_config.R1_CANDIDATES_GROUP2)))) 
-        row.extend(row_base[1+len(test_config.R1_CANDIDATES_GROUP1):]) # Group 2 votes
-        # Pad if fewer votes provided than candidates in group 2
-        row.extend(["0"] * (len(test_config.R1_CANDIDATES_GROUP2) - (len(row_base)-1-len(test_config.R1_CANDIDATES_GROUP1))))
-        full_data_rows.append(row)
-
-
-    csv_file = create_test_csv(tmp_path, "r1_test.csv", round1_headers, data_rows) # Use original data_rows for this test
+    csv_file = create_test_csv_file(tmp_path, "data.csv", headers, data_rows)
+    required_cols = ["CandA", "CandB"]
     
-    result = load_round1_data(str(csv_file))
-    assert result is not None
-    assert len(result) == 2
-    assert result["01"] == (10 + 100 + 5, 2 + 3 + 50) # (115, 55)
-    assert result["02"] == (20 + 200 + 10, 4 + 6 + 100) # (230, 110)
-
-def test_load_round2_data_happy_path(tmp_path: Path, round2_headers: List[str]):
-    # test_config.R2_COMPARISON_CANDIDATE1_NAME = "TRZASKOWSKI Rafał Kazimierz"
-    # test_config.R2_COMPARISON_CANDIDATE2_NAME = "NAWROCKI Karol Tadeusz"
-    data_rows = [
-        # TERYT, TRZASKOWSKI_R2, NAWROCKI_R2
-        ["01",   "90",             "60"],
-        ["02",   "180",            "120"],
-    ]
-    csv_file = create_test_csv(tmp_path, "r2_test.csv", round2_headers, data_rows)
-    result = load_round2_data_for_comparison(str(csv_file))
-    assert result is not None
-    assert len(result) == 2
-    assert result["01"] == (90, 60)
-    assert result["02"] == (180, 120)
-
-def test_load_data_missing_column(tmp_path: Path, caplog):
-    bad_headers = [test_config.TERYT_COLUMN_NAME, "SomeOtherCandidate"] # Missing R1_CANDIDATES_GROUP1
-    csv_file = create_test_csv(tmp_path, "bad_headers.csv", bad_headers, [["01", "100"]])
+    loaded_data = _load_election_data(str(csv_file), required_cols)
     
-    result = load_round1_data(str(csv_file))
-    assert result is None
+    assert loaded_data is not None
+    assert len(loaded_data) == 2
+    assert "001" in loaded_data
+    assert loaded_data["001"]["CandA"] == "100"
+    assert "002" in loaded_data
+    assert loaded_data["002"]["Other"] == "y"
+
+def test_load_election_data_file_not_found(caplog):
+    """Test handling of a non-existent file."""
+    with caplog.at_level(logging.ERROR):
+        loaded_data = _load_election_data("non_existent.csv", ["CandA"])
+    assert loaded_data is None
+    assert "file not found" in caplog.text.lower()
+
+def test_load_election_data_missing_teryt_column(tmp_path: Path, monkeypatch, caplog):
+    """Test handling if the TERYT column (as per config) is missing."""
+    monkeypatch.setattr(live_config, 'TERYT_COLUMN_NAME', 'MISSING_TERYT_COL') # Config expects this
+    headers = ["Actual_TERYT_Col", "CandA"] # File has a different TERYT column name
+    data_rows = [["001", "100"]]
+    csv_file = create_test_csv_file(tmp_path, "missing_teryt.csv", headers, data_rows)
+    
+    with caplog.at_level(logging.ERROR):
+        loaded_data = _load_election_data(str(csv_file), ["CandA"])
+    assert loaded_data is None # Fails because TERYT_COLUMN_NAME (MISSING_TERYT_COL) is not in headers
     assert "missing required columns" in caplog.text.lower()
+    assert "missing_teryt_col" in caplog.text.lower()
 
-def test_load_data_value_error(tmp_path: Path, round1_headers: List[str], caplog):
-    data_rows = [["01", "10", "ABC", "5", "2", "3", "50"]] # ABC is not int
-    csv_file = create_test_csv(tmp_path, "value_error.csv", round1_headers, data_rows)
+
+def test_load_election_data_missing_candidate_column(tmp_path: Path, monkeypatch, caplog):
+    """Test handling if a required candidate column is missing."""
+    monkeypatch.setattr(live_config, 'TERYT_COLUMN_NAME', 'TERYT_ID_COL')
+    headers = ["TERYT_ID_COL", "CandA_Only"]
+    data_rows = [["001", "100"]]
+    csv_file = create_test_csv_file(tmp_path, "missing_cand.csv", headers, data_rows)
+    required_cols = ["CandA_Only", "MissingCandB"] # "MissingCandB" is not in headers
     
-    result = load_round1_data(str(csv_file))
-    assert result is not None
-    assert "01" in result
-    assert result["01"] == (0,0) # Defaulted to zeros due to parse error
-    assert "data parsing error for teryt 01" in caplog.text.lower()
-    assert "defaulting votes to zeros" in caplog.text.lower()
+    with caplog.at_level(logging.ERROR):
+        loaded_data = _load_election_data(str(csv_file), required_cols)
+    assert loaded_data is None
+    assert "missing required columns" in caplog.text.lower()
+    assert "missingcandb" in caplog.text.lower()
 
-# --- Tests for identify_error_teryts ---
-# R1_G1 = sum(Z, TR1, B), R2_C1 = TR2
-# Error if:
-# 1. R1_G1 < R2_C1
-# 2. R2_C1 == 0 AND R1_G1 > 0
-# 3. R2_C1 > 0 AND R1_G1 >= 2 * R2_C1
+def test_load_election_data_empty_file_or_no_headers(tmp_path: Path, caplog):
+    """Test handling of an empty file or a file with no headers."""
+    empty_file = tmp_path / "empty.csv"
+    empty_file.touch()
+    with caplog.at_level(logging.ERROR):
+        assert _load_election_data(str(empty_file), ["CandA"]) is None
+    assert "empty or does not contain headers" in caplog.text.lower()
+    caplog.clear()
 
-@pytest.mark.parametrize("dict1_val, dict2_val, expected_error", [
-    # Case 1: R1_G1 < R2_C1 (Error)
-    ((100, 50), (110, 40), True),  # 100 < 110
-    # Case 2: R2_C1 == 0 AND R1_G1 > 0 (Error)
-    ((10, 50), (0, 40), True),    # 0, 10 > 0
-    # Case 3: R2_C1 > 0 AND R1_G1 >= 2 * R2_C1 (Error)
-    ((100, 50), (50, 40), True),  # 100 >= 2*50 (100)
-    ((100, 50), (40, 30), True),  # 100 >= 2*40 (80)
-    # No Error cases
-    ((100, 50), (90, 60), False), # R1_G1 > R2_C1, R1_G1 < 2*R2_C1 (100 < 180)
-    ((100, 50), (60, 40), False), # R1_G1 > R2_C1, R1_G1 < 2*R2_C1 (100 < 120)
-    ((0, 50), (0, 40), False),    # Both zero
-    ((100, 0), (0, 0), True), # R2_C1 ==0, R1_G1 >0
+    no_headers_file = tmp_path / "no_headers.csv"
+    with open(no_headers_file, 'w') as f: # Write a file with content but no CSV headers line
+        f.write("001;10;20\n") # DictReader will treat this as a row if delimiter is ';', or as a header if no delimiter
+                               # For this test, we rely on DictReader returning no fieldnames for truly empty/malformed
+    
+    # Re-create with writer to ensure it's a valid CSV with no headers
+    with open(no_headers_file, 'w', newline='', encoding=live_config.CSV_ENCODING) as f:
+         # No writer.writerow(headers)
+         writer = csv.writer(f, delimiter=live_config.CSV_DELIMITER)
+         writer.writerow(["001", "10", "20"]) # This effectively becomes the header
+
+    # The test should be about csv.DictReader not finding fieldnames
+    # If the file is just one line, DictReader uses it as fieldnames.
+    # To truly test no fieldnames, the file should be such that DictReader(f).fieldnames is None.
+    # This is hard to simulate with just a text file easily. The empty file case above is more reliable.
+    # For now, we'll rely on the empty file test.
+
+
+# --- Tests for _get_int_vote ---
+
+@pytest.mark.parametrize("vote_input, candidate_name, teryt, expected_output, log_level, log_message_part", [
+    ("123", "CandX", "T01", 123, None, None),             # Valid integer
+    ("", "CandX", "T01", 0, None, None),                  # Empty string (defaulted to 0)
+    (None, "CandX", "T01", 0, None, None),                # None value (defaulted to 0)
+    ("abc", "CandX", "T01", None, logging.WARNING, "invalid (non-integer)"), # Non-integer
+    ("-10", "CandX", "T01", None, logging.WARNING, "negative vote count"),  # Negative integer
+    ("50.5", "CandX", "T01", None, logging.WARNING, "invalid (non-integer)"),# Float string
 ])
-def test_identify_error_teryts_logic(dict1_val: Tuple[int, int], dict2_val: Tuple[int, int], expected_error: bool):
-    # Assuming R2_COMPARISON_CANDIDATE1_NAME is in R1_CANDIDATES_GROUP1 for valid logic
-    assert test_config.R2_COMPARISON_CANDIDATE1_NAME in test_config.R1_CANDIDATES_GROUP1
-    
-    dict1 = {"T1": dict1_val}
-    dict2 = {"T1": dict2_val}
-    
-    error_teryts = identify_error_teryts(dict1, dict2)
-    if expected_error:
-        assert "T1" in error_teryts
+def test_get_int_vote(caplog, vote_input, candidate_name, teryt, expected_output, log_level, log_message_part):
+    """Test _get_int_vote for various inputs."""
+    row_dict = {candidate_name: vote_input}
+    if vote_input is None: # Simulate if the key itself is missing or has None value
+        row_dict = {candidate_name: None} if candidate_name in row_dict else {}
+
+
+    if log_level:
+        with caplog.at_level(log_level):
+            result = _get_int_vote(row_dict, candidate_name, teryt)
     else:
-        assert "T1" not in error_teryts
+        result = _get_int_vote(row_dict, candidate_name, teryt)
 
-def test_identify_error_teryts_multiple_entries(caplog):
-    with caplog.at_level(logging.INFO):
-        dict1 = {
-            "E1": (90, 10),
-            "OK1": (150, 20),
-            "E2": (20, 30),
-            "E3": (120, 40),
-            "OK2": (0, 50),
-            "M1": (100,10)    # TERYT only in dict1
-        }
-        dict2 = {
-            "E1": (100, 5),
-            "OK1": (100, 15),
-            "E2": (0, 25),
-            "E3": (60, 35),
-            "OK2": (0, 45),
-            "M2": (10,100)    # TERYT only in dict2
-        }
-        expected_errors = {"E1", "E2", "E3"}
+    assert result == expected_output
+    if log_message_part:
+        assert log_message_part.lower() in caplog.text.lower()
 
-        error_teryts = identify_error_teryts(dict1, dict2)
-        assert error_teryts == expected_errors
-        
-        assert "from file1 (r1 data) not found in file2 (r2 data)" in caplog.text.lower()
-        assert "teryt m1" in caplog.text.lower()
+def test_get_int_vote_key_missing():
+    """Test _get_int_vote when the candidate key is missing from the row."""
+    row_dict = {"OtherCand": "100"}
+    # When key is missing, row.get(candidate_name) returns None, handled by (None, "CandX", "T01", 0, ...) case
+    assert _get_int_vote(row_dict, "MissingCand", "T01") == 0
 
 
-# --- Test for save_error_teryts ---
-def test_save_error_teryts_output(tmp_path: Path):
-    error_teryts: Set[str] = {"0101011", "0202032", "1465011"}
-    output_file = tmp_path / "test_errors.txt"
+# --- Tests for analyze_relative_strength_shifts ---
+
+# Default thresholds for most shift analysis tests
+DEFAULT_THRESHOLDS = {
+    'MIN_ABS_DIFFERENCE_R1_FOR_SIGNIFICANT_LEAD': 50,
+    'MIN_RATIO_R1_FOR_SIGNIFICANT_LEAD': 1.5,
+    'SIGNIFICANT_SHIFT_RATIO_THRESHOLD_R2': 1.2,
+    'MIN_TOTAL_VOTES_AB_R1_FOR_LEAD_ANALYSIS': 20,
+    'MIN_TOTAL_VOTES_AB_R2_FOR_SHIFT_ANALYSIS': 20,
+}
+
+@pytest.mark.parametrize("v1A, v1B, v2A, v2B, expected_conclusion_enum, desc_part", [
+    # --- Scenarios with Lead A in R1 ---
+    (100, 20, 120, 30, ShiftAnalysisConclusion.LEAD_A_R1_MAINTAINED_OR_INCREASED_R2, "maintained/increased"),
+    (100, 20, 80, 15, ShiftAnalysisConclusion.LEAD_A_R1_MAINTAINED_OR_INCREASED_R2, "maintained/increased"), # Ratio still high
+    (100, 20, 70, 60, ShiftAnalysisConclusion.LEAD_A_R1_LOST_OR_REDUCED_SIGNIFICANTLY_R2, "lost or significantly reduced"), # Ratio A/B R2 = 1.16 < 1.2 (threshold)
+    (100, 20, 60, 70, ShiftAnalysisConclusion.LEAD_A_R1_REVERSED_TO_LEAD_B_R2, "reversed in r2, favoring candb_r2"),
+    # --- Scenarios with Lead B in R1 ---
+    (20, 100, 30, 120, ShiftAnalysisConclusion.LEAD_B_R1_MAINTAINED_OR_INCREASED_R2, "maintained/increased"),
+    (20, 100, 15, 80, ShiftAnalysisConclusion.LEAD_B_R1_MAINTAINED_OR_INCREASED_R2, "maintained/increased"),
+    (20, 100, 60, 70, ShiftAnalysisConclusion.LEAD_B_R1_LOST_OR_REDUCED_SIGNIFICANTLY_R2, "lost or significantly reduced"), # Ratio B/A R2 = 1.16 < 1.2
+    (20, 100, 70, 60, ShiftAnalysisConclusion.LEAD_B_R1_REVERSED_TO_LEAD_A_R2, "reversed in r2, favoring canda_r2"),
+    # --- Scenarios with No Significant Lead in R1 ---
+    (50, 40, 55, 45, ShiftAnalysisConclusion.NO_SIGNIFICANT_LEAD_R1_NO_SIGNIFICANT_SHIFT_R2, "no significant lead for either candidate in r1"), # R1 diff=10 < 50
+    (60, 50, 100, 20, ShiftAnalysisConclusion.NO_LEAD_R1_NEW_LEAD_A_R2, "gained a new significant lead in r2"), # R1 ratio 1.2 < 1.5
+    (50, 60, 20, 100, ShiftAnalysisConclusion.NO_LEAD_R1_NEW_LEAD_B_R2, "gained a new significant lead in r2"),
+    # --- Inconclusive Scenarios ---
+    (5, 3, 100, 80, ShiftAnalysisConclusion.INCONCLUSIVE_LOW_VOTES_R1, "r1 total votes for a+b"), # R1 sum = 8 < 20
+    (60, 50, 5, 3, ShiftAnalysisConclusion.INCONCLUSIVE_LOW_VOTES_R2, "r2 total votes for a+b"),   # R2 sum = 8 < 20
+    # --- Data Issues ---
+    (100, 20, -5, 30, ShiftAnalysisConclusion.DATA_ISSUE_INVALID_VOTES, "invalid or missing vote data"), # Negative vote
+    (100, None, 50, 30, ShiftAnalysisConclusion.DATA_ISSUE_INVALID_VOTES, "invalid or missing vote data"), # Missing vote (None)
+])
+def test_analyze_relative_strength_shifts_various_scenarios(
+    monkeypatch, v1A, v1B, v2A, v2B, expected_conclusion_enum, desc_part
+):
+    """Test analyze_relative_strength_shifts with various vote combinations."""
+    # Setup mock config using monkeypatch
+    mock_config_for_shift_analysis_tests(
+        monkeypatch, "CandA_R1", "CandA_R2", "CandB_R1", "CandB_R2", DEFAULT_THRESHOLDS
+    )
+
+    # Prepare mock data
+    # _get_int_vote handles None from data_r1/data_r2 by returning None (or 0 based on its internal default for empty)
+    # For testing DATA_ISSUE_INVALID_VOTES, we pass None where appropriate.
+    data_r1 = {"T1": {"TERYT_ID_COL": "T1", "CandA_R1": str(v1A) if v1A is not None else None, "CandB_R1": str(v1B) if v1B is not None else None}}
+    data_r2 = {"T1": {"TERYT_ID_COL": "T1", "CandA_R2": str(v2A) if v2A is not None else None, "CandB_R2": str(v2B) if v2B is not None else None}}
     
-    save_error_teryts(error_teryts, str(output_file))
+    # Handle cases where vote inputs are intended to be None for the _get_int_vote function
+    if v1A is None: data_r1["T1"]["CandA_R1"] = None
+    if v1B is None: data_r1["T1"]["CandB_R1"] = None
+    if v2A is None: data_r2["T1"]["CandA_R2"] = None
+    if v2B is None: data_r2["T1"]["CandB_R2"] = None
+
+
+    analysis_results = analyze_relative_strength_shifts(data_r1, data_r2)
+    
+    assert len(analysis_results) == 1
+    result_t1 = analysis_results[0]
+    
+    assert isinstance(result_t1, TerytShiftAnalysis)
+    assert result_t1.teryt == "T1"
+    assert result_t1.conclusion == expected_conclusion_enum
+    assert desc_part.lower() in result_t1.description.lower(), \
+        f"Expected description part '{desc_part}' not found in '{result_t1.description}' for conclusion {result_t1.conclusion}"
+
+    # Further assertions on vote counts if they are not None
+    if v1A is not None and v1A >= 0: assert result_t1.votes_r1_cand_A == v1A
+    if v1B is not None and v1B >= 0: assert result_t1.votes_r1_cand_B == v1B
+    if v2A is not None and v2A >= 0: assert result_t1.votes_r2_cand_A == v2A
+    if v2B is not None and v2B >= 0: assert result_t1.votes_r2_cand_B == v2B
+
+
+def test_analyze_relative_strength_shifts_different_teryts(monkeypatch):
+    """Test handling of TERYTs present in only one dataset."""
+    mock_config_for_shift_analysis_tests(
+        monkeypatch, "A_R1", "A_R2", "B_R1", "B_R2", DEFAULT_THRESHOLDS
+    )
+    data_r1 = {
+        "T1": {"TERYT_ID_COL": "T1", "A_R1": "100", "B_R1": "50"}, # Common
+        "T2": {"TERYT_ID_COL": "T2", "A_R1": "70", "B_R1": "30"}  # R1 only
+    }
+    data_r2 = {
+        "T1": {"TERYT_ID_COL": "T1", "A_R2": "110", "B_R2": "60"}, # Common
+        "T3": {"TERYT_ID_COL": "T3", "A_R2": "80", "B_R2": "40"}  # R2 only
+    }
+
+    with कैपlog.at_level(logging.INFO): # To check for logs about T2 and T3
+        analysis_results = analyze_relative_strength_shifts(data_r1, data_r2)
+    
+    assert len(analysis_results) == 1 # Only T1 is common
+    assert analysis_results[0].teryt == "T1"
+    assert "teryts found only in round 1 data" in caplog.text.lower()
+    assert "t2" in caplog.text.lower()
+    assert "teryts found only in round 2 data" in caplog.text.lower()
+    assert "t3" in caplog.text.lower()
+
+
+# --- Tests for save_analysis_report_to_json ---
+
+def test_save_analysis_report_to_json(tmp_path: Path):
+    """Test saving the analysis report to a JSON file."""
+    res1 = TerytShiftAnalysis("T01")
+    res1.votes_r1_cand_A = 100; res1.votes_r1_cand_B = 50
+    res1.votes_r2_cand_A = 120; res1.votes_r2_cand_B = 60
+    res1.conclusion = ShiftAnalysisConclusion.LEAD_A_R1_MAINTAINED_OR_INCREASED_R2
+    res1.description = "Test desc 1"
+
+    res2 = TerytShiftAnalysis("T02")
+    res2.conclusion = ShiftAnalysisConclusion.INCONCLUSIVE_LOW_VOTES_R1
+    res2.description = "Test desc 2"
+    
+    report_data = [res1, res2]
+    output_file = tmp_path / "report.json"
+    
+    save_analysis_report_to_json(report_data, str(output_file))
+    
+    assert output_file.exists()
+    with open(output_file, 'r', encoding='utf-8') as f:
+        loaded_report = json.load(f)
+    
+    assert len(loaded_report) == 2
+    assert loaded_report[0]["teryt"] == "T01"
+    assert loaded_report[0]["conclusion"] == ShiftAnalysisConclusion.LEAD_A_R1_MAINTAINED_OR_INCREASED_R2.value
+    assert loaded_report[0]["votes_r1_cand_A"] == 100
+    assert loaded_report[1]["teryt"] == "T02"
+    assert loaded_report[1]["conclusion"] == ShiftAnalysisConclusion.INCONCLUSIVE_LOW_VOTES_R1.value
+
+
+# --- Tests for generate_suspicious_shifts_file ---
+
+def test_generate_suspicious_shifts_file(tmp_path: Path):
+    """Test generation of the text file with TERYTs for investigation."""
+    res1 = TerytShiftAnalysis("T01"); res1.conclusion = ShiftAnalysisConclusion.LEAD_A_R1_REVERSED_TO_LEAD_B_R2
+    res2 = TerytShiftAnalysis("T02"); res2.conclusion = ShiftAnalysisConclusion.NO_SIGNIFICANT_LEAD_R1_NO_SIGNIFICANT_SHIFT_R2
+    res3 = TerytShiftAnalysis("T03"); res3.conclusion = ShiftAnalysisConclusion.LEAD_B_R1_LOST_OR_REDUCED_SIGNIFICANTLY_R2
+    res4 = TerytShiftAnalysis("T04"); res4.conclusion = ShiftAnalysisConclusion.LEAD_A_R1_MAINTAINED_OR_INCREASED_R2
+    
+    report_data = [res1, res2, res3, res4]
+    output_file = tmp_path / "suspicious.txt"
+    
+    generate_suspicious_shifts_file(report_data, str(output_file))
     
     assert output_file.exists()
     with open(output_file, 'r', encoding='utf-8') as f:
         content = f.read().splitlines()
     
-    assert sorted(list(error_teryts)) == sorted(content) # Compare sorted content
+    # T01 and T03 should be flagged based on current generate_suspicious_shifts_file logic
+    assert set(content) == {"T01", "T03"}
+    assert sorted(content) == ["T01", "T03"] # Check sorting
 
-def test_save_error_teryts_empty_set(tmp_path: Path):
-    error_teryts: Set[str] = set()
-    output_file = tmp_path / "empty_errors.txt"
-    save_error_teryts(error_teryts, str(output_file))
+def test_generate_suspicious_shifts_file_empty(tmp_path: Path):
+    """Test generation of an empty suspicious shifts file."""
+    res1 = TerytShiftAnalysis("T01"); res1.conclusion = ShiftAnalysisConclusion.NO_SIGNIFICANT_LEAD_R1_NO_SIGNIFICANT_SHIFT_R2
+    res2 = TerytShiftAnalysis("T02"); res2.conclusion = ShiftAnalysisConclusion.LEAD_A_R1_MAINTAINED_OR_INCREASED_R2
+
+    report_data = [res1, res2]
+    output_file = tmp_path / "empty_suspicious.txt"
+    generate_suspicious_shifts_file(report_data, str(output_file))
     assert output_file.exists()
     with open(output_file, 'r', encoding='utf-8') as f:
         content = f.read()
