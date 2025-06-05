@@ -1,26 +1,27 @@
 # Election Data Analysis and Anomaly Detection Scripts
 
-This project provides Python scripts for in-depth analysis of election data, designed to identify potential anomalies and inconsistencies between different rounds of voting (or different datasets). It attempts to categorize these anomalies and generates a detailed report, as well as a list of administrative units (TERYTs) where specific types of errors, like potential vote swaps, are suspected. An additional script can then use this list to perform vote adjustments.
+This project provides Python scripts for in-depth analysis of election data, designed to identify potential anomalies and inconsistencies between different rounds of voting (or different datasets). It attempts to categorize these anomalies and generates a detailed report, as well as a list of administrative units (TERYTs) where significant ratio shifts between candidates are detected. An additional script can then use this list to perform optional vote adjustments.
 
 ## Project Structure
 
-- `config.py`: Central configuration hub for file paths, key candidate names for analysis, group definitions from Round 1, CSV settings, and thresholds for anomaly detection.
+- `config.py`: Central configuration hub for file paths, key candidate names for analysis, CSV settings, and thresholds for anomaly detection.
 - `error_identifier.py`:
     - Loads election data from two primary CSV files (e.g., Round 1 and Round 2 results).
-    - Performs a detailed, symmetric analysis for two key candidates, checking for various anomaly types (e.g., R1 group sum vs. R2 individual votes, zero votes in R2 despite R1 support, disproportionate R2 results compared to R1 group).
-    - Derives a conclusion about the nature of anomalies for each TERYT (e.g., `POTENTIAL_SWAP_A_FAVORS_B`, `DATA_INCONSISTENCY_COMPLEX`, `NO_ANOMALY`).
-    - Generates a comprehensive `error_analysis_report.json` file detailing the findings for each TERYT.
-    - Generates a `teryts_to_swap_votes.txt` file containing TERYTs where a vote swap is suspected, intended for use by `vote_adjuster.py`.
+    - Performs a detailed, ratio-based analysis for two key candidates, checking for various anomaly types (e.g., zero votes in R2 despite R1 support, disproportionate R2 results compared to R1, extreme reversals).
+    - Assigns an anomaly level for each TERYT (e.g., `LARGE_ANOMALY_A_LOST_SHARE_VS_B`, `NO_ANOMALY`, `DATA_ISSUE_INVALID_VOTES`).
+    - Generates a comprehensive `election_ratio_analysis_report.json` file detailing the findings for each TERYT.
+    - Generates a `significant_ratio_shifts_teryts.txt` file containing TERYTs where a significant or suspicious ratio shift is detected, intended for use by `vote_adjuster.py`.
+    - Produces a human-readable summary in `election_ratio_analysis_summary.txt`.
 - `vote_adjuster.py`:
     - Reads a specified CSV file (typically Round 2 results).
-    - Reads the `teryts_to_swap_votes.txt` file.
-    - For TERYTs listed in the swap file, it exchanges the vote counts between two pre-configured candidates.
-    - Outputs the recalculated total votes.
+    - Reads the `significant_ratio_shifts_teryts.txt` file.
+    - For TERYTs listed in the file, it swaps the vote counts between two pre-configured candidates.
+    - Outputs the recalculated total votes and a summary report.
 - `test_error_identifier.py`: Pytest unit tests for `error_identifier.py`.
 - `test_vote_adjuster.py`: Pytest unit tests for `vote_adjuster.py`.
 - `pyproject.toml`: Project metadata and dependency specification for PDM (Python Development Master).
 - `pdm.lock`: Lock file ensuring reproducible builds with PDM, detailing exact versions of all dependencies.
-- `.gitignore`: Specifies intentionally untracked files that Git should ignore (e.g., virtual environments, cache files, potentially output reports).
+- `.gitignore`: Specifies intentionally untracked files that Git should ignore (e.g., virtual environments, cache files, output reports).
 - `README.md`: This file, providing an overview and instructions.
 
 Input data CSV files (e.g., `wyniki_gl_na_kandydatow_po_gminach_utf8.csv`) are expected to be in the project's root directory, or their paths must be correctly configured in `config.py`.
@@ -71,21 +72,22 @@ Ensure your input CSV files are located in the project's root directory, or alte
 
 Execute all scripts within the PDM-managed environment by prefixing commands with `pdm run`.
 
-### 1. Perform Detailed Error Analysis
+### 1. Perform Ratio-Based Anomaly Analysis
 
-This script is the core of the anomaly detection process. It analyzes data from the configured Round 1 and Round 2 CSV files.
+This script is the core of the anomaly detection process. It analyzes data from the configured Round 1 and Round 2 CSV files using ratio-based logic.
 ```bash
 pdm run python error_identifier.py
 ```
 **Outputs:**
-- `error_analysis_report.json`: A detailed JSON file containing the analysis results for each common TERYT, including raw vote counts, identified individual anomalies for key candidates, and a derived overall conclusion. This report is crucial for manual review and understanding the nature of potential issues.
-- `teryts_to_swap_votes.txt`: A simple text file listing TERYT codes where the analysis suggests a potential vote swap between the two main configured candidates. This file serves as input for the `vote_adjuster.py` script.
+- `election_ratio_analysis_report.json`: A detailed JSON file containing the analysis results for each common TERYT, including raw vote counts, anomaly levels, and a description of the detected anomaly.
+- `significant_ratio_shifts_teryts.txt`: A simple text file listing TERYT codes where the analysis suggests a significant or suspicious ratio shift between the two main configured candidates. This file serves as input for the `vote_adjuster.py` script.
+- `election_ratio_analysis_summary.txt`: A human-readable summary of the anomaly analysis.
 
-**It is highly recommended to review `error_analysis_report.json` before proceeding with vote adjustments.**
+**It is highly recommended to review `election_ratio_analysis_report.json` and the summary before proceeding with vote adjustments.**
 
 ### 2. Adjust Vote Counts (Optional, based on analysis)
 
-This script uses the `teryts_to_swap_votes.txt` generated in the previous step to perform vote adjustments.
+This script uses the `significant_ratio_shifts_teryts.txt` generated in the previous step to perform vote adjustments.
 ```bash
 pdm run python vote_adjuster.py
 ```
@@ -133,8 +135,7 @@ pdm run pytest
 Critical operational parameters are centralized in `config.py`. This includes:
 - Paths to input and output data files.
 - Names of key candidates for analysis and vote adjustment.
-- Definitions of candidate groups from Round 1 used for comparisons.
 - CSV processing settings (delimiter, encoding).
-- Thresholds used in the anomaly detection logic (e.g., `PROPORTIONALITY_THRESHOLD_FACTOR`).
+- Thresholds used in the anomaly detection logic (e.g., `SMALL_ANOMALY_RATIO_CHANGE_FACTOR`, `LARGE_ANOMALY_RATIO_CHANGE_FACTOR`, `MIN_ABS_VOTE_SHIFT_FOR_SIGNIFICANT_ANOMALY`).
 
 Review and modify `config.py` to match your specific dataset, analytical requirements, and candidate focus.
