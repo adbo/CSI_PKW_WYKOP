@@ -1,1 +1,29 @@
-venv/
+# PDM
+.pdm-build/
+.pdm.toml
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Test reports and coverage
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Build artifacts (ogólne)
+dist/
+build/
+*.egg-info/
